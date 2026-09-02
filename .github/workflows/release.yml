@@ -8,8 +8,20 @@ name: Build and Release Desktop
 # The actual React application lives in the separate private
 # Okpanz/biz-insight repository.
 #
-# BIZ_INSIGHT_PAT must be configured as a repository secret
-# with read access to Okpanz/biz-insight.
+# Installers are published to Cloudflare R2 (the same bucket brillix-api
+# already uses) at a fixed path, so the public download URL never changes
+# between releases — this repo is private, so GitHub Release assets
+# aren't publicly downloadable, which is why R2 is the actual distribution
+# point and the GitHub Release is kept only as internal history.
+#
+# Required repository secrets:
+#   BIZ_INSIGHT_PAT       — read access to Okpanz/biz-insight
+#   R2_ACCOUNT_ID
+#   R2_ACCESS_KEY_ID
+#   R2_SECRET_ACCESS_KEY
+#   R2_BUCKET_NAME
+#   R2_PUBLIC_URL         — e.g. https://pub-xxxx.r2.dev (used by the
+#                           downloads page config, not by this workflow)
 
 on:
   push:
@@ -142,13 +154,33 @@ jobs:
           ls -lh release-assets/
 
       # ---------------------------------------------------------
-      # Upload to GitHub Release
+      # Publish to R2 (public download URL — brillix-desktop is a
+      # private repo, so GitHub Release assets aren't publicly
+      # downloadable; the /downloads page links here instead).
+      # Fixed key means the public URL never changes between
+      # releases — only the file content does.
       # ---------------------------------------------------------
-      - name: Upload macOS release asset
+      - name: Upload macOS installer to R2
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          aws s3 cp release-assets/Brillix-macOS-Universal.dmg \
+            "s3://${{ secrets.R2_BUCKET_NAME }}/desktop-releases/Brillix-macOS-Universal.dmg" \
+            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" \
+            --content-type application/x-apple-diskimage
+
+      # ---------------------------------------------------------
+      # Also keep a versioned GitHub Release for internal history
+      # (private repo, not used for public downloads).
+      # ---------------------------------------------------------
+      - name: Record GitHub Release (internal)
         uses: softprops/action-gh-release@v2
         with:
           files: release-assets/Brillix-macOS-Universal.dmg
-          draft: true
+          draft: false
           body_path: brillix-desktop/RELEASE_NOTES.md
 
 
@@ -275,11 +307,29 @@ jobs:
           ls -lh release-assets/
 
       # ---------------------------------------------------------
-      # Upload to GitHub Release
+      # Publish to R2 (see macOS job for why — brillix-desktop is
+      # private, so GitHub Release assets can't be downloaded
+      # publicly; fixed key keeps the public URL stable).
       # ---------------------------------------------------------
-      - name: Upload Windows release asset
+      - name: Upload Windows installer to R2
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          aws s3 cp release-assets/Brillix-Windows-x64-Setup.exe \
+            "s3://${{ secrets.R2_BUCKET_NAME }}/desktop-releases/Brillix-Windows-x64-Setup.exe" \
+            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" \
+            --content-type application/vnd.microsoft.portable-executable
+
+      # ---------------------------------------------------------
+      # Also keep a versioned GitHub Release for internal history
+      # (private repo, not used for public downloads).
+      # ---------------------------------------------------------
+      - name: Record GitHub Release (internal)
         uses: softprops/action-gh-release@v2
         with:
           files: release-assets/Brillix-Windows-x64-Setup.exe
-          draft: true
+          draft: false
           body_path: brillix-desktop/RELEASE_NOTES.md
