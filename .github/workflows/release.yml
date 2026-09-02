@@ -1,16 +1,15 @@
 name: Build and Release Desktop
 
-# Builds Brillix Desktop for macOS (Universal: Apple Silicon + Intel) and
-# Windows x64, then attaches the installers to a GitHub Release.
+# Builds Brillix Desktop for:
+# - macOS Universal (Apple Silicon + Intel)
+# - Windows x64
 #
-# This repo (brillix-desktop) holds only the Tauri shell — the actual app
-# code lives in the separate biz-insight repo, so every job checks that out
-# too, as a sibling directory, matching the local dev layout that
-# tauri.conf.json's frontendDist/beforeBuildCommand already expect.
+# The Tauri shell lives in this repository (brillix-desktop).
+# The actual React application lives in the separate private
+# Okpanz/biz-insight repository.
 #
-# Requires a repo secret BIZ_INSIGHT_PAT: a GitHub personal access token
-# with read access to Okpanz/biz-insight (a private repo), since the
-# default GITHUB_TOKEN here can't check out a different repository.
+# BIZ_INSIGHT_PAT must be configured as a repository secret
+# with read access to Okpanz/biz-insight.
 
 on:
   push:
@@ -25,100 +24,263 @@ jobs:
   macos:
     name: macOS (Universal)
     runs-on: macos-latest
+
     steps:
+      # ---------------------------------------------------------
+      # Checkout desktop shell
+      # ---------------------------------------------------------
       - name: Checkout brillix-desktop
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: brillix-desktop
 
+      # ---------------------------------------------------------
+      # Verify access to private biz-insight repository
+      # ---------------------------------------------------------
+      - name: Verify biz-insight access
+        shell: bash
+        env:
+          BIZ_INSIGHT_PAT: ${{ secrets.BIZ_INSIGHT_PAT }}
+        run: |
+          if [ -z "$BIZ_INSIGHT_PAT" ]; then
+            echo "ERROR: BIZ_INSIGHT_PAT secret is not configured."
+            exit 1
+          fi
+
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $BIZ_INSIGHT_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/Okpanz/biz-insight)
+
+          echo "GitHub API response: $STATUS"
+
+          if [ "$STATUS" != "200" ]; then
+            echo "ERROR: Cannot access Okpanz/biz-insight."
+            echo "Check BIZ_INSIGHT_PAT repository access and permissions."
+            exit 1
+          fi
+
+          echo "Successfully authenticated to Okpanz/biz-insight."
+
+      # ---------------------------------------------------------
+      # Checkout private frontend repository
+      # ---------------------------------------------------------
       - name: Checkout biz-insight
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: Okpanz/biz-insight
           path: biz-insight
           token: ${{ secrets.BIZ_INSIGHT_PAT }}
 
+      # ---------------------------------------------------------
+      # Node
+      # ---------------------------------------------------------
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            biz-insight/package-lock.json
+            brillix-desktop/package-lock.json
 
-      - name: Install Rust (Apple Silicon + Intel targets)
+      # ---------------------------------------------------------
+      # Rust
+      # ---------------------------------------------------------
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
+      # ---------------------------------------------------------
+      # Frontend dependencies
+      # ---------------------------------------------------------
       - name: Install biz-insight dependencies
         working-directory: biz-insight
         run: npm ci
 
+      # ---------------------------------------------------------
+      # Tauri dependencies
+      # ---------------------------------------------------------
       - name: Install brillix-desktop dependencies
         working-directory: brillix-desktop
         run: npm ci
 
+      # ---------------------------------------------------------
+      # Build macOS Universal
+      # ---------------------------------------------------------
       - name: Build Universal macOS app
         working-directory: brillix-desktop
         run: npx tauri build --target universal-apple-darwin
 
-      - name: Collect release asset
+      # ---------------------------------------------------------
+      # Collect release artifact
+      # ---------------------------------------------------------
+      - name: Collect macOS release asset
+        shell: bash
         run: |
-          mkdir -p release-assets
-          cp brillix-desktop/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg \
-             release-assets/Brillix-macOS-Universal.dmg
+          set -e
 
-      - name: Upload to GitHub Release
+          mkdir -p release-assets
+
+          DMG=$(find \
+            brillix-desktop/src-tauri/target/universal-apple-darwin/release/bundle/dmg \
+            -maxdepth 1 \
+            -type f \
+            -name "*.dmg" \
+            | head -n 1)
+
+          if [ -z "$DMG" ]; then
+            echo "ERROR: macOS DMG was not generated."
+            exit 1
+          fi
+
+          cp "$DMG" \
+            release-assets/Brillix-macOS-Universal.dmg
+
+          echo "Created:"
+          ls -lh release-assets/
+
+      # ---------------------------------------------------------
+      # Upload to GitHub Release
+      # ---------------------------------------------------------
+      - name: Upload macOS release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: release-assets/*
+          files: release-assets/Brillix-macOS-Universal.dmg
           draft: true
           body_path: brillix-desktop/RELEASE_NOTES.md
+
+
+  # =================================================================
+  # WINDOWS
+  # =================================================================
 
   windows:
     name: Windows (x64)
     runs-on: windows-latest
+
     steps:
+      # ---------------------------------------------------------
+      # Checkout desktop shell
+      # ---------------------------------------------------------
       - name: Checkout brillix-desktop
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: brillix-desktop
 
+      # ---------------------------------------------------------
+      # Verify access to private biz-insight repository
+      # ---------------------------------------------------------
+      - name: Verify biz-insight access
+        shell: bash
+        env:
+          BIZ_INSIGHT_PAT: ${{ secrets.BIZ_INSIGHT_PAT }}
+        run: |
+          if [ -z "$BIZ_INSIGHT_PAT" ]; then
+            echo "ERROR: BIZ_INSIGHT_PAT secret is not configured."
+            exit 1
+          fi
+
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $BIZ_INSIGHT_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/Okpanz/biz-insight)
+
+          echo "GitHub API response: $STATUS"
+
+          if [ "$STATUS" != "200" ]; then
+            echo "ERROR: Cannot access Okpanz/biz-insight."
+            echo "Check BIZ_INSIGHT_PAT repository access and permissions."
+            exit 1
+          fi
+
+          echo "Successfully authenticated to Okpanz/biz-insight."
+
+      # ---------------------------------------------------------
+      # Checkout private frontend repository
+      # ---------------------------------------------------------
       - name: Checkout biz-insight
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: Okpanz/biz-insight
           path: biz-insight
           token: ${{ secrets.BIZ_INSIGHT_PAT }}
 
+      # ---------------------------------------------------------
+      # Node
+      # ---------------------------------------------------------
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            biz-insight/package-lock.json
+            brillix-desktop/package-lock.json
 
+      # ---------------------------------------------------------
+      # Rust
+      # ---------------------------------------------------------
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # ---------------------------------------------------------
+      # Frontend dependencies
+      # ---------------------------------------------------------
       - name: Install biz-insight dependencies
         working-directory: biz-insight
         run: npm ci
 
+      # ---------------------------------------------------------
+      # Tauri dependencies
+      # ---------------------------------------------------------
+      - name: Install brillix-desktop dependencies
       - name: Install brillix-desktop dependencies
         working-directory: brillix-desktop
         run: npm ci
 
+      # ---------------------------------------------------------
+      # Build Windows x64
+      # ---------------------------------------------------------
       - name: Build Windows app
         working-directory: brillix-desktop
         run: npx tauri build
 
-      - name: Collect release asset
+      # ---------------------------------------------------------
+      # Collect release artifact
+      # ---------------------------------------------------------
+      - name: Collect Windows release asset
         shell: bash
         run: |
-          mkdir -p release-assets
-          cp brillix-desktop/src-tauri/target/release/bundle/nsis/*.exe \
-             release-assets/Brillix-Windows-x64-Setup.exe
+          set -e
 
-      - name: Upload to GitHub Release
+          mkdir -p release-assets
+
+          EXE=$(find \
+            brillix-desktop/src-tauri/target/release/bundle/nsis \
+            -maxdepth 1 \
+            -type f \
+            -name "*.exe" \
+            | head -n 1)
+
+          if [ -z "$EXE" ]; then
+            echo "ERROR: Windows NSIS installer was not generated."
+            exit 1
+          fi
+
+          cp "$EXE" \
+            release-assets/Brillix-Windows-x64-Setup.exe
+
+          echo "Created:"
+          ls -lh release-assets/
+
+      # ---------------------------------------------------------
+      # Upload to GitHub Release
+      # ---------------------------------------------------------
+      - name: Upload Windows release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: release-assets/*
+          files: release-assets/Brillix-Windows-x64-Setup.exe
           draft: true
           body_path: brillix-desktop/RELEASE_NOTES.md
