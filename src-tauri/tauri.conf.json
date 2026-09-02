@@ -1,0 +1,53 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Brillix",
+  "version": "1.0.0",
+  "identifier": "ng.getbrillix.desktop",
+  "build": {
+    "frontendDist": "../../biz-insight/dist",
+    "devUrl": "http://localhost:8080",
+    "beforeDevCommand": "cd ../biz-insight && npm run dev",
+    "beforeBuildCommand": "cd ../biz-insight && npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Brillix",
+        "width": 800,
+        "height": 600,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "publisher": "Brillix",
+    "homepage": "https://getbrillix.com.ng",
+    "copyright": "© 2026 Brillix. All rights reserved.",
+    "shortDescription": "All-in-one business management platform",
+    "longDescription": "Brillix is a powerful, intuitive business management platform for small and medium-sized businesses. Manage sales, inventory, expenses, and teams—all from one dashboard.",
+    "category": "Business",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "android": {
+      "debugApplicationIdSuffix": ".debug"
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["brillix"]
+      }
+    }
+  }
+}
