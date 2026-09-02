@@ -236,7 +236,6 @@ jobs:
       # Tauri dependencies
       # ---------------------------------------------------------
       - name: Install brillix-desktop dependencies
-      - name: Install brillix-desktop dependencies
         working-directory: brillix-desktop
         run: npm ci
 
