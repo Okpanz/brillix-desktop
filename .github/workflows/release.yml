@@ -1,0 +1,124 @@
+name: Build and Release Desktop
+
+# Builds Brillix Desktop for macOS (Universal: Apple Silicon + Intel) and
+# Windows x64, then attaches the installers to a GitHub Release.
+#
+# This repo (brillix-desktop) holds only the Tauri shell — the actual app
+# code lives in the separate biz-insight repo, so every job checks that out
+# too, as a sibling directory, matching the local dev layout that
+# tauri.conf.json's frontendDist/beforeBuildCommand already expect.
+#
+# Requires a repo secret BIZ_INSIGHT_PAT: a GitHub personal access token
+# with read access to Okpanz/biz-insight (a private repo), since the
+# default GITHUB_TOKEN here can't check out a different repository.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: macOS (Universal)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout brillix-desktop
+        uses: actions/checkout@v4
+        with:
+          path: brillix-desktop
+
+      - name: Checkout biz-insight
+        uses: actions/checkout@v4
+        with:
+          repository: Okpanz/biz-insight
+          path: biz-insight
+          token: ${{ secrets.BIZ_INSIGHT_PAT }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust (Apple Silicon + Intel targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Install biz-insight dependencies
+        working-directory: biz-insight
+        run: npm ci
+
+      - name: Install brillix-desktop dependencies
+        working-directory: brillix-desktop
+        run: npm ci
+
+      - name: Build Universal macOS app
+        working-directory: brillix-desktop
+        run: npx tauri build --target universal-apple-darwin
+
+      - name: Collect release asset
+        run: |
+          mkdir -p release-assets
+          cp brillix-desktop/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg \
+             release-assets/Brillix-macOS-Universal.dmg
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          draft: true
+          body_path: brillix-desktop/RELEASE_NOTES.md
+
+  windows:
+    name: Windows (x64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout brillix-desktop
+        uses: actions/checkout@v4
+        with:
+          path: brillix-desktop
+
+      - name: Checkout biz-insight
+        uses: actions/checkout@v4
+        with:
+          repository: Okpanz/biz-insight
+          path: biz-insight
+          token: ${{ secrets.BIZ_INSIGHT_PAT }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install biz-insight dependencies
+        working-directory: biz-insight
+        run: npm ci
+
+      - name: Install brillix-desktop dependencies
+        working-directory: brillix-desktop
+        run: npm ci
+
+      - name: Build Windows app
+        working-directory: brillix-desktop
+        run: npx tauri build
+
+      - name: Collect release asset
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          cp brillix-desktop/src-tauri/target/release/bundle/nsis/*.exe \
+             release-assets/Brillix-Windows-x64-Setup.exe
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          draft: true
+          body_path: brillix-desktop/RELEASE_NOTES.md
