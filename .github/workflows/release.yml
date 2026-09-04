@@ -15,6 +15,14 @@ name: Build and Release Desktop
 # publicly downloadable, which is why R2 is the actual distribution point
 # and the GitHub Release is kept only as internal history.
 #
+# Two ways to run this workflow:
+#   - Push a tag matching v*.*.* (e.g. v1.0.1): a full production release —
+#     both platforms build, artifacts publish to R2, the updater manifest is
+#     published, and exactly one GitHub Release is created for that tag.
+#   - workflow_dispatch (manual run): builds both platforms and publishes to
+#     R2 for testing, but never creates a GitHub Release (there is no tag to
+#     attach one to).
+#
 # Required repository secrets:
 #   BIZ_INSIGHT_PAT                     — read access to Okpanz/biz-insight
 #   R2_ACCOUNT_ID
@@ -35,8 +43,93 @@ permissions:
   contents: write
 
 jobs:
+  # =================================================================
+  # VALIDATE — runs first, on a cheap ubuntu runner, before any expensive
+  # macOS/Windows build starts. Decides whether this run is a tagged
+  # production release or a manual test run, and fails fast (before
+  # spending build minutes) on a malformed tag, a tag/tauri.conf.json
+  # version mismatch, or a missing required secret.
+  # =================================================================
+
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    outputs:
+      is_tag_release: ${{ steps.detect.outputs.is_tag_release }}
+      version: ${{ steps.detect.outputs.version }}
+
+    steps:
+      - name: Checkout brillix-desktop
+        uses: actions/checkout@v5
+
+      - name: Detect release type and validate version
+        id: detect
+        shell: bash
+        run: |
+          set -e
+          TAURI_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            echo "Tagged production release detected: $TAG"
+
+            if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "ERROR: Tag '$TAG' does not match the required vX.Y.Z format (e.g. v1.0.1)."
+              exit 1
+            fi
+
+            TAG_VERSION="${TAG#v}"
+            echo "Tag version:   $TAG_VERSION"
+            echo "Tauri version: $TAURI_VERSION"
+
+            if [ "$TAG_VERSION" != "$TAURI_VERSION" ]; then
+              echo "ERROR: Git tag version ($TAG_VERSION) does not match src-tauri/tauri.conf.json version ($TAURI_VERSION)."
+              echo "Update the version in tauri.conf.json (and package.json / Cargo.toml), commit it, then re-tag."
+              exit 1
+            fi
+
+            echo "is_tag_release=true" >> "$GITHUB_OUTPUT"
+            echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+          else
+            echo "Manual workflow run detected. GitHub Release creation will be skipped because no release tag exists."
+            echo "is_tag_release=false" >> "$GITHUB_OUTPUT"
+            echo "version=$TAURI_VERSION" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate required secrets are present
+        shell: bash
+        env:
+          BIZ_INSIGHT_PAT: ${{ secrets.BIZ_INSIGHT_PAT }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          # TAURI_SIGNING_PRIVATE_KEY_PASSWORD is intentionally not checked
+          # here — an empty passphrase on the signing key is valid.
+          missing=0
+          for name in BIZ_INSIGHT_PAT R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET_NAME R2_PUBLIC_URL TAURI_SIGNING_PRIVATE_KEY; do
+            value="${!name}"
+            if [ -z "$value" ]; then
+              echo "ERROR: required secret $name is not set."
+              missing=1
+            fi
+          done
+          if [ "$missing" -eq 1 ]; then
+            exit 1
+          fi
+          echo "All required secrets are present."
+
+  # =================================================================
+  # MACOS — builds and uploads to R2 only. GitHub Release creation
+  # happens once, later, in publish-github-release.
+  # =================================================================
+
   macos:
     name: macOS (Universal)
+    needs: validate
     runs-on: macos-latest
 
     steps:
@@ -135,6 +228,19 @@ jobs:
           echo "Created:"
           ls -lh release-assets/
 
+      - name: Ensure AWS CLI is available
+        shell: bash
+        run: |
+          if command -v aws >/dev/null 2>&1; then
+            echo "AWS CLI already available: $(aws --version)"
+          else
+            echo "AWS CLI not found on this runner — installing via pip..."
+            PYTHON_BIN=$(command -v python3 || command -v python)
+            "$PYTHON_BIN" -m pip install --user --quiet awscli
+            echo "$HOME/Library/Python/3.9/bin" >> "$GITHUB_PATH"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
+
       - name: Upload macOS assets to R2
         shell: bash
         env:
@@ -181,22 +287,23 @@ jobs:
           name: manifest-fragment-macos
           path: fragment/macos.json
 
-      - name: Record GitHub Release (internal)
-        uses: softprops/action-gh-release@v2
+      # Consumed only by publish-github-release, and only for a tagged run —
+      # kept as a build artifact rather than a GitHub Release so macOS and
+      # Windows never race to create/update the same Release.
+      - name: Upload macOS release assets (for GitHub Release)
+        uses: actions/upload-artifact@v4
         with:
-          files: |
-            release-assets/Brillix-macOS-Universal.dmg
-            release-assets/Brillix-macOS-Universal.app.tar.gz
-            release-assets/Brillix-macOS-Universal.app.tar.gz.sig
-          draft: false
-          body_path: brillix-desktop/RELEASE_NOTES.md
+          name: release-assets-macos
+          path: release-assets
+          retention-days: 1
 
   # =================================================================
-  # WINDOWS
+  # WINDOWS — builds and uploads to R2 only. Same split as macOS above.
   # =================================================================
 
   windows:
     name: Windows (x64)
+    needs: validate
     runs-on: windows-latest
 
     steps:
@@ -288,6 +395,19 @@ jobs:
           echo "Created:"
           ls -lh release-assets/
 
+      - name: Ensure AWS CLI is available
+        shell: bash
+        run: |
+          if command -v aws >/dev/null 2>&1; then
+            echo "AWS CLI already available: $(aws --version)"
+          else
+            echo "AWS CLI not found on this runner — installing via pip..."
+            PYTHON_BIN=$(command -v python3 || command -v python)
+            "$PYTHON_BIN" -m pip install --user --quiet awscli
+            echo "$APPDATA/Python/Scripts" >> "$GITHUB_PATH"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
+
       - name: Upload Windows assets to R2
         shell: bash
         env:
@@ -322,24 +442,26 @@ jobs:
           name: manifest-fragment-windows
           path: fragment/windows.json
 
-      - name: Record GitHub Release (internal)
-        uses: softprops/action-gh-release@v2
+      # Consumed only by publish-github-release, and only for a tagged run —
+      # see the matching step in the macos job for why this isn't a Release
+      # created directly from this job.
+      - name: Upload Windows release assets (for GitHub Release)
+        uses: actions/upload-artifact@v4
         with:
-          files: |
-            release-assets/Brillix-Windows-x64-Setup.exe
-            release-assets/Brillix-Windows-x64-Setup.exe.sig
-          draft: false
-          body_path: brillix-desktop/RELEASE_NOTES.md
+          name: release-assets-windows
+          path: release-assets
+          retention-days: 1
 
   # =================================================================
   # UPDATER MANIFEST — merges both platform jobs' fragments into the
   # single latest.json the desktop app polls (tauri.conf.json's
-  # plugins.updater.endpoints).
+  # plugins.updater.endpoints). Runs on every trigger (tag or manual)
+  # so manual runs can be used to test the full R2 publish path.
   # =================================================================
 
   publish-manifest:
     name: Publish updater manifest
-    needs: [macos, windows]
+    needs: [validate, macos, windows]
     runs-on: ubuntu-latest
 
     steps:
@@ -359,9 +481,9 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
+          VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -e
-          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
           NOTES=$(cat RELEASE_NOTES.md)
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -385,3 +507,47 @@ jobs:
             --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" \
             --content-type application/json \
             --cache-control "no-cache"
+
+  # =================================================================
+  # GITHUB RELEASE — the single place a GitHub Release is created.
+  # Only runs for a tagged production release (push of a v*.*.* tag);
+  # never for workflow_dispatch, where there is no tag to attach a
+  # release to. Artifacts come from the macOS/Windows jobs' uploaded
+  # build artifacts, not the local filesystem of this job's runner.
+  # =================================================================
+
+  publish-github-release:
+    name: Publish GitHub Release
+    needs: [validate, macos, windows, publish-manifest]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout brillix-desktop
+        uses: actions/checkout@v5
+
+      - name: Download macOS release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets-macos
+          path: release-assets
+
+      - name: Download Windows release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets-windows
+          path: release-assets
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Brillix Desktop ${{ github.ref_name }}
+          draft: false
+          body_path: RELEASE_NOTES.md
+          files: |
+            release-assets/Brillix-macOS-Universal.dmg
+            release-assets/Brillix-macOS-Universal.app.tar.gz
+            release-assets/Brillix-macOS-Universal.app.tar.gz.sig
+            release-assets/Brillix-Windows-x64-Setup.exe
+            release-assets/Brillix-Windows-x64-Setup.exe.sig
