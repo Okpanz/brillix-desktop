@@ -8,6 +8,8 @@
   "permissions": [
     "core:default",
     "shell:allow-open",
-    "deep-link:default"
+    "deep-link:default",
+    "updater:default",
+    "process:default"
   ]
 }

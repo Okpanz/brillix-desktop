@@ -8,20 +8,22 @@ name: Build and Release Desktop
 # The actual React application lives in the separate private
 # Okpanz/biz-insight repository.
 #
-# Installers are published to Cloudflare R2 (the same bucket brillix-api
-# already uses) at a fixed path, so the public download URL never changes
-# between releases — this repo is private, so GitHub Release assets
-# aren't publicly downloadable, which is why R2 is the actual distribution
-# point and the GitHub Release is kept only as internal history.
+# Installers AND the auto-updater artifacts/manifest are published to
+# Cloudflare R2 (the same bucket brillix-api already uses) at fixed keys,
+# so the public download URL and the updater endpoint never change between
+# releases — this repo is private, so GitHub Release assets aren't
+# publicly downloadable, which is why R2 is the actual distribution point
+# and the GitHub Release is kept only as internal history.
 #
 # Required repository secrets:
-#   BIZ_INSIGHT_PAT       — read access to Okpanz/biz-insight
+#   BIZ_INSIGHT_PAT                     — read access to Okpanz/biz-insight
 #   R2_ACCOUNT_ID
 #   R2_ACCESS_KEY_ID
 #   R2_SECRET_ACCESS_KEY
 #   R2_BUCKET_NAME
-#   R2_PUBLIC_URL         — e.g. https://pub-xxxx.r2.dev (used by the
-#                           downloads page config, not by this workflow)
+#   R2_PUBLIC_URL                       — e.g. https://pub-xxxx.r2.dev
+#   TAURI_SIGNING_PRIVATE_KEY           — from `tauri signer generate`
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  — may be empty if the key has none
 
 on:
   push:
@@ -38,17 +40,11 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      # ---------------------------------------------------------
-      # Checkout desktop shell
-      # ---------------------------------------------------------
       - name: Checkout brillix-desktop
         uses: actions/checkout@v5
         with:
           path: brillix-desktop
 
-      # ---------------------------------------------------------
-      # Verify access to private biz-insight repository
-      # ---------------------------------------------------------
       - name: Verify biz-insight access
         shell: bash
         env:
@@ -74,9 +70,6 @@ jobs:
 
           echo "Successfully authenticated to Okpanz/biz-insight."
 
-      # ---------------------------------------------------------
-      # Checkout private frontend repository
-      # ---------------------------------------------------------
       - name: Checkout biz-insight
         uses: actions/checkout@v5
         with:
@@ -84,9 +77,6 @@ jobs:
           path: biz-insight
           token: ${{ secrets.BIZ_INSIGHT_PAT }}
 
-      # ---------------------------------------------------------
-      # Node
-      # ---------------------------------------------------------
       - name: Setup Node
         uses: actions/setup-node@v5
         with:
@@ -96,93 +86,110 @@ jobs:
             biz-insight/package-lock.json
             brillix-desktop/package-lock.json
 
-      # ---------------------------------------------------------
-      # Rust
-      # ---------------------------------------------------------
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
-      # ---------------------------------------------------------
-      # Frontend dependencies
-      # ---------------------------------------------------------
       - name: Install biz-insight dependencies
         working-directory: biz-insight
         run: npm ci
 
-      # ---------------------------------------------------------
-      # Tauri dependencies
-      # ---------------------------------------------------------
       - name: Install brillix-desktop dependencies
         working-directory: brillix-desktop
         run: npm ci
 
-      # ---------------------------------------------------------
-      # Build macOS Universal
-      # ---------------------------------------------------------
+      # TAURI_SIGNING_PRIVATE_KEY[_PASSWORD] being set makes Tauri sign the
+      # updater artifact (the .app.tar.gz alongside the .dmg) automatically —
+      # see tauri.conf.json's bundle.createUpdaterArtifacts.
       - name: Build Universal macOS app
         working-directory: brillix-desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npx tauri build --target universal-apple-darwin
 
-      # ---------------------------------------------------------
-      # Collect release artifact
-      # ---------------------------------------------------------
-      - name: Collect macOS release asset
+      - name: Collect macOS release assets
+        id: collect
         shell: bash
         run: |
           set -e
-
+          BUNDLE_DIR="brillix-desktop/src-tauri/target/universal-apple-darwin/release/bundle"
           mkdir -p release-assets
 
-          DMG=$(find \
-            brillix-desktop/src-tauri/target/universal-apple-darwin/release/bundle/dmg \
-            -maxdepth 1 \
-            -type f \
-            -name "*.dmg" \
-            | head -n 1)
+          DMG=$(find "$BUNDLE_DIR/dmg" -maxdepth 1 -type f -name "*.dmg" | head -n 1)
+          UPDATER=$(find "$BUNDLE_DIR/macos" -maxdepth 1 -type f -name "*.app.tar.gz" | head -n 1)
+          SIG_FILE=$(find "$BUNDLE_DIR/macos" -maxdepth 1 -type f -name "*.app.tar.gz.sig" | head -n 1)
 
-          if [ -z "$DMG" ]; then
-            echo "ERROR: macOS DMG was not generated."
+          if [ -z "$DMG" ] || [ -z "$UPDATER" ] || [ -z "$SIG_FILE" ]; then
+            echo "ERROR: expected macOS build outputs were not all generated."
+            echo "dmg=$DMG updater=$UPDATER sig=$SIG_FILE"
             exit 1
           fi
 
-          cp "$DMG" \
-            release-assets/Brillix-macOS-Universal.dmg
+          cp "$DMG" release-assets/Brillix-macOS-Universal.dmg
+          cp "$UPDATER" release-assets/Brillix-macOS-Universal.app.tar.gz
+          cp "$SIG_FILE" release-assets/Brillix-macOS-Universal.app.tar.gz.sig
 
+          echo "signature=$(cat "$SIG_FILE")" >> "$GITHUB_OUTPUT"
           echo "Created:"
           ls -lh release-assets/
 
-      # ---------------------------------------------------------
-      # Publish to R2 (public download URL — brillix-desktop is a
-      # private repo, so GitHub Release assets aren't publicly
-      # downloadable; the /downloads page links here instead).
-      # Fixed key means the public URL never changes between
-      # releases — only the file content does.
-      # ---------------------------------------------------------
-      - name: Upload macOS installer to R2
+      - name: Upload macOS assets to R2
         shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
         run: |
-          aws s3 cp release-assets/Brillix-macOS-Universal.dmg \
-            "s3://${{ secrets.R2_BUCKET_NAME }}/desktop-releases/Brillix-macOS-Universal.dmg" \
-            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" \
-            --content-type application/x-apple-diskimage
+          ENDPOINT="https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          BUCKET="s3://${{ secrets.R2_BUCKET_NAME }}/desktop-releases"
 
-      # ---------------------------------------------------------
-      # Also keep a versioned GitHub Release for internal history
-      # (private repo, not used for public downloads).
-      # ---------------------------------------------------------
+          aws s3 cp release-assets/Brillix-macOS-Universal.dmg "$BUCKET/Brillix-macOS-Universal.dmg" \
+            --endpoint-url "$ENDPOINT" --content-type application/x-apple-diskimage
+          aws s3 cp release-assets/Brillix-macOS-Universal.app.tar.gz "$BUCKET/Brillix-macOS-Universal.app.tar.gz" \
+            --endpoint-url "$ENDPOINT" --content-type application/gzip
+          aws s3 cp release-assets/Brillix-macOS-Universal.app.tar.gz.sig "$BUCKET/Brillix-macOS-Universal.app.tar.gz.sig" \
+            --endpoint-url "$ENDPOINT" --content-type text/plain
+
+      # A universal binary reports as darwin-aarch64 when running on Apple
+      # Silicon and darwin-x86_64 on Intel (the updater checks cfg!(target_arch)
+      # at runtime, which reflects whichever slice of the fat binary the OS
+      # loaded) — both keys need an entry, and since it's the same file for
+      # both, they point at the same URL/signature. This fragment gets merged
+      # with Windows' in the publish-manifest job below.
+      - name: Save platform manifest fragment
+        shell: bash
+        run: |
+          mkdir -p fragment
+          cat > fragment/macos.json <<EOF
+          {
+            "darwin-aarch64": {
+              "signature": "${{ steps.collect.outputs.signature }}",
+              "url": "${{ secrets.R2_PUBLIC_URL }}/desktop-releases/Brillix-macOS-Universal.app.tar.gz"
+            },
+            "darwin-x86_64": {
+              "signature": "${{ steps.collect.outputs.signature }}",
+              "url": "${{ secrets.R2_PUBLIC_URL }}/desktop-releases/Brillix-macOS-Universal.app.tar.gz"
+            }
+          }
+          EOF
+
+      - name: Upload platform fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-fragment-macos
+          path: fragment/macos.json
+
       - name: Record GitHub Release (internal)
         uses: softprops/action-gh-release@v2
         with:
-          files: release-assets/Brillix-macOS-Universal.dmg
+          files: |
+            release-assets/Brillix-macOS-Universal.dmg
+            release-assets/Brillix-macOS-Universal.app.tar.gz
+            release-assets/Brillix-macOS-Universal.app.tar.gz.sig
           draft: false
           body_path: brillix-desktop/RELEASE_NOTES.md
-
 
   # =================================================================
   # WINDOWS
@@ -193,17 +200,11 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      # ---------------------------------------------------------
-      # Checkout desktop shell
-      # ---------------------------------------------------------
       - name: Checkout brillix-desktop
         uses: actions/checkout@v5
         with:
           path: brillix-desktop
 
-      # ---------------------------------------------------------
-      # Verify access to private biz-insight repository
-      # ---------------------------------------------------------
       - name: Verify biz-insight access
         shell: bash
         env:
@@ -229,9 +230,6 @@ jobs:
 
           echo "Successfully authenticated to Okpanz/biz-insight."
 
-      # ---------------------------------------------------------
-      # Checkout private frontend repository
-      # ---------------------------------------------------------
       - name: Checkout biz-insight
         uses: actions/checkout@v5
         with:
@@ -239,9 +237,6 @@ jobs:
           path: biz-insight
           token: ${{ secrets.BIZ_INSIGHT_PAT }}
 
-      # ---------------------------------------------------------
-      # Node
-      # ---------------------------------------------------------
       - name: Setup Node
         uses: actions/setup-node@v5
         with:
@@ -251,85 +246,142 @@ jobs:
             biz-insight/package-lock.json
             brillix-desktop/package-lock.json
 
-      # ---------------------------------------------------------
-      # Rust
-      # ---------------------------------------------------------
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # ---------------------------------------------------------
-      # Frontend dependencies
-      # ---------------------------------------------------------
       - name: Install biz-insight dependencies
         working-directory: biz-insight
         run: npm ci
 
-      # ---------------------------------------------------------
-      # Tauri dependencies
-      # ---------------------------------------------------------
       - name: Install brillix-desktop dependencies
         working-directory: brillix-desktop
         run: npm ci
 
-      # ---------------------------------------------------------
-      # Build Windows x64
-      # ---------------------------------------------------------
       - name: Build Windows app
         working-directory: brillix-desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npx tauri build
 
-      # ---------------------------------------------------------
-      # Collect release artifact
-      # ---------------------------------------------------------
-      - name: Collect Windows release asset
+      - name: Collect Windows release assets
+        id: collect
         shell: bash
         run: |
           set -e
-
+          BUNDLE_DIR="brillix-desktop/src-tauri/target/release/bundle/nsis"
           mkdir -p release-assets
 
-          EXE=$(find \
-            brillix-desktop/src-tauri/target/release/bundle/nsis \
-            -maxdepth 1 \
-            -type f \
-            -name "*.exe" \
-            | head -n 1)
+          EXE=$(find "$BUNDLE_DIR" -maxdepth 1 -type f -name "*.exe" | head -n 1)
+          SIG_FILE=$(find "$BUNDLE_DIR" -maxdepth 1 -type f -name "*.exe.sig" | head -n 1)
 
-          if [ -z "$EXE" ]; then
-            echo "ERROR: Windows NSIS installer was not generated."
+          if [ -z "$EXE" ] || [ -z "$SIG_FILE" ]; then
+            echo "ERROR: expected Windows build outputs were not all generated."
+            echo "exe=$EXE sig=$SIG_FILE"
             exit 1
           fi
 
-          cp "$EXE" \
-            release-assets/Brillix-Windows-x64-Setup.exe
+          cp "$EXE" release-assets/Brillix-Windows-x64-Setup.exe
+          cp "$SIG_FILE" release-assets/Brillix-Windows-x64-Setup.exe.sig
 
+          echo "signature=$(cat "$SIG_FILE")" >> "$GITHUB_OUTPUT"
           echo "Created:"
           ls -lh release-assets/
 
-      # ---------------------------------------------------------
-      # Publish to R2 (see macOS job for why — brillix-desktop is
-      # private, so GitHub Release assets can't be downloaded
-      # publicly; fixed key keeps the public URL stable).
-      # ---------------------------------------------------------
-      - name: Upload Windows installer to R2
+      - name: Upload Windows assets to R2
         shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
         run: |
-          aws s3 cp release-assets/Brillix-Windows-x64-Setup.exe \
-            "s3://${{ secrets.R2_BUCKET_NAME }}/desktop-releases/Brillix-Windows-x64-Setup.exe" \
-            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" \
-            --content-type application/vnd.microsoft.portable-executable
+          ENDPOINT="https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          BUCKET="s3://${{ secrets.R2_BUCKET_NAME }}/desktop-releases"
 
-      # ---------------------------------------------------------
-      # Also keep a versioned GitHub Release for internal history
-      # (private repo, not used for public downloads).
-      # ---------------------------------------------------------
+          aws s3 cp release-assets/Brillix-Windows-x64-Setup.exe "$BUCKET/Brillix-Windows-x64-Setup.exe" \
+            --endpoint-url "$ENDPOINT" --content-type application/vnd.microsoft.portable-executable
+          aws s3 cp release-assets/Brillix-Windows-x64-Setup.exe.sig "$BUCKET/Brillix-Windows-x64-Setup.exe.sig" \
+            --endpoint-url "$ENDPOINT" --content-type text/plain
+
+      - name: Save platform manifest fragment
+        shell: bash
+        run: |
+          mkdir -p fragment
+          cat > fragment/windows.json <<EOF
+          {
+            "windows-x86_64": {
+              "signature": "${{ steps.collect.outputs.signature }}",
+              "url": "${{ secrets.R2_PUBLIC_URL }}/desktop-releases/Brillix-Windows-x64-Setup.exe"
+            }
+          }
+          EOF
+
+      - name: Upload platform fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-fragment-windows
+          path: fragment/windows.json
+
       - name: Record GitHub Release (internal)
         uses: softprops/action-gh-release@v2
         with:
-          files: release-assets/Brillix-Windows-x64-Setup.exe
+          files: |
+            release-assets/Brillix-Windows-x64-Setup.exe
+            release-assets/Brillix-Windows-x64-Setup.exe.sig
           draft: false
           body_path: brillix-desktop/RELEASE_NOTES.md
+
+  # =================================================================
+  # UPDATER MANIFEST — merges both platform jobs' fragments into the
+  # single latest.json the desktop app polls (tauri.conf.json's
+  # plugins.updater.endpoints).
+  # =================================================================
+
+  publish-manifest:
+    name: Publish updater manifest
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout brillix-desktop
+        uses: actions/checkout@v5
+
+      - name: Download platform fragments
+        uses: actions/download-artifact@v4
+        with:
+          pattern: manifest-fragment-*
+          path: fragments
+          merge-multiple: true
+
+      - name: Build and upload latest.json
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          set -e
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          NOTES=$(cat RELEASE_NOTES.md)
+          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          jq -n \
+            --arg version "$VERSION" \
+            --arg notes "$NOTES" \
+            --arg pub_date "$PUB_DATE" \
+            --slurpfile macos fragments/macos.json \
+            --slurpfile windows fragments/windows.json \
+            '{
+              version: $version,
+              notes: $notes,
+              pub_date: $pub_date,
+              platforms: ($macos[0] + $windows[0])
+            }' > latest.json
+
+          echo "Generated manifest:"
+          cat latest.json
+
+          aws s3 cp latest.json "s3://${{ secrets.R2_BUCKET_NAME }}/desktop-releases/latest.json" \
+            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" \
+            --content-type application/json \
+            --cache-control "no-cache"

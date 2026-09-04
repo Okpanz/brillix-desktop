@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Brillix",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "identifier": "ng.getbrillix.desktop",
   "build": {
     "frontendDist": "../../biz-insight/dist",
@@ -41,13 +41,20 @@
     ],
     "android": {
       "debugApplicationIdSuffix": ".debug"
-    }
+    },
+    "createUpdaterArtifacts": true
   },
   "plugins": {
     "deep-link": {
       "desktop": {
         "schemes": ["brillix"]
       }
+    },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY2RTM1Qzk5ODE1OEVEOEQKUldTTjdWaUJtVnpqOWhUcHZyeEFXS1MrMS9sdGxGeTZsMjM2NWh6cjdpOXRFVURFNnh5a3g5ZHkK",
+      "endpoints": [
+        "https://pub-492b4464b2694f59a704520939156a78.r2.dev/desktop-releases/latest.json"
+      ]
     }
   }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "brillix-desktop"
-version = "1.0.0"
+version = "1.0.1"
 description = "Brillix desktop app"
 authors = ["Brillix"]
 license = ""
@@ -25,3 +25,5 @@ tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
 tauri-plugin-shell = "2.3.6"
 tauri-plugin-deep-link = "2.4.10"
+tauri-plugin-updater = "2.11.0"
+tauri-plugin-process = "2.3.1"
