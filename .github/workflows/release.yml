@@ -1,7 +1,8 @@
 name: Build and Release Desktop
 
 # Builds Brillix Desktop for:
-# - macOS Universal (Apple Silicon + Intel)
+# - macOS Universal (Apple Silicon + Intel) — Apple Developer ID signed and
+#   notarized, so Gatekeeper accepts it with no "Open Anyway" workaround.
 # - Windows x64
 #
 # The Tauri shell lives in this repository (brillix-desktop).
@@ -16,12 +17,18 @@ name: Build and Release Desktop
 # and the GitHub Release is kept only as internal history.
 #
 # Two ways to run this workflow:
-#   - Push a tag matching v*.*.* (e.g. v1.0.1): a full production release —
-#     both platforms build, artifacts publish to R2, the updater manifest is
+#   - Push a tag matching v*.*.* (e.g. v1.0.2): a full production release —
+#     both platforms build, macOS is Apple-signed/notarized/stapled and
+#     Gatekeeper-validated, artifacts publish to R2, the updater manifest is
 #     published, and exactly one GitHub Release is created for that tag.
+#     Apple signing secrets are REQUIRED for a tagged release — the run
+#     fails fast if they're missing rather than publishing an unsigned
+#     production build.
 #   - workflow_dispatch (manual run): builds both platforms and publishes to
 #     R2 for testing, but never creates a GitHub Release (there is no tag to
-#     attach one to).
+#     attach one to). Apple signing runs only if the secrets happen to be
+#     configured; otherwise it builds an unsigned macOS app, same as before
+#     this signing pipeline existed.
 #
 # Required repository secrets:
 #   BIZ_INSIGHT_PAT                     — read access to Okpanz/biz-insight
@@ -30,8 +37,26 @@ name: Build and Release Desktop
 #   R2_SECRET_ACCESS_KEY
 #   R2_BUCKET_NAME
 #   R2_PUBLIC_URL                       — e.g. https://pub-xxxx.r2.dev
-#   TAURI_SIGNING_PRIVATE_KEY           — from `tauri signer generate`
+#   TAURI_SIGNING_PRIVATE_KEY           — from `tauri signer generate` (Tauri
+#                                          UPDATER signing — separate from,
+#                                          and unrelated to, Apple signing
+#                                          below; do not confuse the two)
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  — may be empty if the key has none
+#
+# Required secrets for macOS Apple Developer ID signing + notarization
+# (required for a tagged release; optional for a manual test run):
+#   APPLE_CERTIFICATE                   — base64-encoded Developer ID
+#                                          Application .p12 certificate
+#   APPLE_CERTIFICATE_PASSWORD          — password the .p12 was exported with
+#   APPLE_SIGNING_IDENTITY              — e.g. "Developer ID Application:
+#                                          Your Name/Org (TEAMID)"
+#   APPLE_TEAM_ID                       — your Apple Developer Team ID
+#   APPLE_API_KEY_ID                    — App Store Connect API key ID
+#   APPLE_API_ISSUER                    — App Store Connect API issuer ID
+#   APPLE_API_PRIVATE_KEY               — the API key's .p8 file contents,
+#                                          pasted as-is (not base64)
+# All seven must be set together — see the repo README / project docs for
+# how to obtain each one.
 
 on:
   push:
@@ -48,7 +73,8 @@ jobs:
   # macOS/Windows build starts. Decides whether this run is a tagged
   # production release or a manual test run, and fails fast (before
   # spending build minutes) on a malformed tag, a tag/tauri.conf.json
-  # version mismatch, or a missing required secret.
+  # version mismatch, a missing required secret, or (for a tagged release)
+  # missing Apple signing secrets.
   # =================================================================
 
   validate:
@@ -57,6 +83,7 @@ jobs:
     outputs:
       is_tag_release: ${{ steps.detect.outputs.is_tag_release }}
       version: ${{ steps.detect.outputs.version }}
+      apple_signing_enabled: ${{ steps.secrets_check.outputs.apple_signing_enabled }}
 
     steps:
       - name: Checkout brillix-desktop
@@ -74,7 +101,7 @@ jobs:
             echo "Tagged production release detected: $TAG"
 
             if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "ERROR: Tag '$TAG' does not match the required vX.Y.Z format (e.g. v1.0.1)."
+              echo "ERROR: Tag '$TAG' does not match the required vX.Y.Z format (e.g. v1.0.2)."
               exit 1
             fi
 
@@ -91,12 +118,13 @@ jobs:
             echo "is_tag_release=true" >> "$GITHUB_OUTPUT"
             echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
           else
-            echo "Manual workflow run detected. GitHub Release creation will be skipped because no release tag exists."
+            echo "Manual test build detected (workflow_dispatch). GitHub Release creation will be skipped because no release tag exists."
             echo "is_tag_release=false" >> "$GITHUB_OUTPUT"
             echo "version=$TAURI_VERSION" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Validate required secrets are present
+        id: secrets_check
         shell: bash
         env:
           BIZ_INSIGHT_PAT: ${{ secrets.BIZ_INSIGHT_PAT }}
@@ -106,6 +134,14 @@ jobs:
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          IS_TAG_RELEASE: ${{ steps.detect.outputs.is_tag_release }}
         run: |
           # TAURI_SIGNING_PRIVATE_KEY_PASSWORD is intentionally not checked
           # here — an empty passphrase on the signing key is valid.
@@ -117,14 +153,37 @@ jobs:
               missing=1
             fi
           done
+
+          apple_missing=0
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_TEAM_ID APPLE_API_KEY_ID APPLE_API_ISSUER APPLE_API_PRIVATE_KEY; do
+            value="${!name}"
+            if [ -z "$value" ]; then
+              apple_missing=1
+            fi
+          done
+
+          if [ "$apple_missing" -eq 0 ]; then
+            echo "Apple Developer ID signing secrets are present — macOS build will be signed and notarized."
+            echo "apple_signing_enabled=true" >> "$GITHUB_OUTPUT"
+          elif [ "$IS_TAG_RELEASE" == "true" ]; then
+            echo "ERROR: this is a tagged production release, but one or more Apple signing secrets are missing."
+            echo "Required: APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY, APPLE_TEAM_ID, APPLE_API_KEY_ID, APPLE_API_ISSUER, APPLE_API_PRIVATE_KEY."
+            echo "A production macOS release must be signed and notarized — refusing to publish an unsigned build."
+            missing=1
+          else
+            echo "Apple signing secrets are not fully configured — this manual run will build an UNSIGNED macOS app (fine for testing, not for distribution)."
+            echo "apple_signing_enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
           if [ "$missing" -eq 1 ]; then
             exit 1
           fi
           echo "All required secrets are present."
 
   # =================================================================
-  # MACOS — builds and uploads to R2 only. GitHub Release creation
-  # happens once, later, in publish-github-release.
+  # MACOS — builds, Apple-signs, notarizes, staples, validates, and
+  # uploads to R2. GitHub Release creation happens once, later, in
+  # publish-github-release.
   # =================================================================
 
   macos:
@@ -192,15 +251,101 @@ jobs:
         working-directory: brillix-desktop
         run: npm ci
 
+      # Apple Developer ID signing is separate from, and unrelated to, the
+      # Tauri updater signing below (TAURI_SIGNING_PRIVATE_KEY) — this is
+      # what satisfies macOS Gatekeeper; the updater key only lets the app's
+      # own auto-updater trust a downloaded update package. A temporary,
+      # job-scoped keychain is used instead of the runner's login keychain,
+      # and is deleted in the cleanup step at the end of this job.
+      - name: Import Apple Developer ID certificate
+        if: needs.validate.outputs.apple_signing_enabled == 'true'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -e
+          KEYCHAIN_PATH="$RUNNER_TEMP/apple-signing.keychain-db"
+          CERTIFICATE_PATH="$RUNNER_TEMP/apple-certificate.p12"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+
+          echo "$APPLE_CERTIFICATE" | base64 --decode -o "$CERTIFICATE_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
+
+          rm -f "$CERTIFICATE_PATH"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+          echo "Imported signing identities:"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      # App Store Connect API key auth for notarytool — Apple's recommended
+      # non-interactive method for CI (no Apple ID / app-specific password /
+      # 2FA involved). The .p8 contents are written to a file only Tauri's
+      # build process reads; the path is exported via GITHUB_ENV so the
+      # build step below picks it up as APPLE_API_KEY_PATH automatically.
+      - name: Write Apple API private key for notarization
+        if: needs.validate.outputs.apple_signing_enabled == 'true'
+        shell: bash
+        env:
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          set -e
+          KEY_PATH="$RUNNER_TEMP/apple_api_key.p8"
+          printf '%s' "$APPLE_API_PRIVATE_KEY" > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          echo "APPLE_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
       # TAURI_SIGNING_PRIVATE_KEY[_PASSWORD] being set makes Tauri sign the
       # updater artifact (the .app.tar.gz alongside the .dmg) automatically —
-      # see tauri.conf.json's bundle.createUpdaterArtifacts.
+      # see tauri.conf.json's bundle.createUpdaterArtifacts. Separately, when
+      # APPLE_SIGNING_IDENTITY (and the other Apple secrets below) are set,
+      # Tauri's bundler codesigns the .app with the Developer ID identity
+      # from the keychain imported above, then notarizes and staples it with
+      # Apple, all as part of this one build command — no separate manual
+      # notarytool/stapler invocation is needed for the primary artifacts.
+      # When Apple signing is disabled (manual run, no secrets configured),
+      # these env vars are simply empty and Tauri produces an unsigned app,
+      # exactly as it did before this signing pipeline existed.
       - name: Build Universal macOS app
         working-directory: brillix-desktop
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
         run: npx tauri build --target universal-apple-darwin
+
+      # Fails the build if the shipped binary isn't actually a fat/universal
+      # binary — catches a misconfigured target or a toolchain regression
+      # before it ever reaches a customer's Intel or Apple Silicon Mac.
+      - name: Verify universal binary (arm64 + x86_64)
+        shell: bash
+        run: |
+          set -e
+          BINARY="brillix-desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos/Brillix.app/Contents/MacOS/Brillix"
+
+          if [ ! -f "$BINARY" ]; then
+            echo "ERROR: expected universal binary not found at $BINARY"
+            exit 1
+          fi
+
+          echo "file: $(file "$BINARY")"
+          LIPO_INFO=$(lipo -info "$BINARY")
+          echo "lipo -info: $LIPO_INFO"
+
+          if ! echo "$LIPO_INFO" | grep -q "x86_64" || ! echo "$LIPO_INFO" | grep -q "arm64"; then
+            echo "ERROR: the built app is not a universal binary (expected both x86_64 and arm64 slices)."
+            exit 1
+          fi
+          echo "Universal binary check: PASSED (contains arm64 + x86_64)"
 
       - name: Collect macOS release assets
         id: collect
@@ -227,6 +372,56 @@ jobs:
           echo "signature=$(cat "$SIG_FILE")" >> "$GITHUB_OUTPUT"
           echo "Created:"
           ls -lh release-assets/
+
+      # Validates the EXACT artifact a customer downloads (mounts the real
+      # DMG rather than re-checking the pre-packaging build directory), so
+      # a passing result here means Gatekeeper will genuinely accept it —
+      # not just that signing "ran" earlier in the build. Fails the whole
+      # job (before R2 upload) if any check fails.
+      - name: Validate Apple signing, notarization, and Gatekeeper acceptance
+        if: needs.validate.outputs.apple_signing_enabled == 'true'
+        shell: bash
+        run: |
+          set -e
+          DMG="release-assets/Brillix-macOS-Universal.dmg"
+          MOUNT_POINT="$RUNNER_TEMP/brillix-dmg-mount"
+          mkdir -p "$MOUNT_POINT"
+
+          cleanup() {
+            hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          hdiutil attach "$DMG" -mountpoint "$MOUNT_POINT" -nobrowse -quiet
+          APP_PATH=$(find "$MOUNT_POINT" -maxdepth 1 -type d -name "*.app" | head -n 1)
+
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: could not find a .app bundle inside the mounted DMG."
+            exit 1
+          fi
+
+          echo "--- codesign --verify --deep --strict ---"
+          if ! codesign --verify --deep --strict --verbose=2 "$APP_PATH"; then
+            echo "Apple signing: FAILED"
+            exit 1
+          fi
+          echo "Apple signing: PASSED"
+
+          echo "--- xcrun stapler validate (notarization ticket) ---"
+          if ! xcrun stapler validate "$APP_PATH"; then
+            echo "Notarization: FAILED"
+            echo "Stapling: FAILED"
+            exit 1
+          fi
+          echo "Notarization: PASSED"
+          echo "Stapling: PASSED"
+
+          echo "--- spctl --assess (Gatekeeper simulation) ---"
+          if ! spctl --assess --type execute --verbose=4 "$APP_PATH"; then
+            echo "Gatekeeper validation: FAILED"
+            exit 1
+          fi
+          echo "Gatekeeper validation: PASSED"
 
       - name: Ensure AWS CLI is available
         shell: bash
@@ -297,8 +492,21 @@ jobs:
           path: release-assets
           retention-days: 1
 
+      # GitHub-hosted macOS runners are destroyed after the job regardless,
+      # but this removes the temporary keychain and the decoded certificate
+      # / API key files as defense in depth, and runs even if an earlier
+      # step in this job failed.
+      - name: Clean up Apple signing keychain and key files
+        if: always() && needs.validate.outputs.apple_signing_enabled == 'true'
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/apple-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/apple-certificate.p12" "$RUNNER_TEMP/apple_api_key.p8" 2>/dev/null || true
+          echo "Cleaned up temporary Apple signing keychain and key files."
+
   # =================================================================
-  # WINDOWS — builds and uploads to R2 only. Same split as macOS above.
+  # WINDOWS — builds and uploads to R2 only. No Apple-specific logic here.
+  # Same job-split-from-Release-creation pattern as macOS above.
   # =================================================================
 
   windows:
